@@ -38,16 +38,34 @@ def fetch_multiple_coins(coin_ids, days='365'):
     return merged_df.dropna()
 
 def store_to_sqlite(df, db_name='crypto_data.db', table_name='prices'):
-    """Store DataFrame to SQLite database."""
+    """Store DataFrame to SQLite database, adding a timestamp column for when data was pulled."""
+    df = df.copy()
+    df['pulled_at'] = pd.Timestamp.now()
     engine = create_engine(f'sqlite:///{db_name}', echo=False)
     df.to_sql(table_name, con=engine, if_exists='replace')
     print(f"✅ Stored data in {db_name}, table '{table_name}'")
 
+
+# Function to load cached data if recent (<24h)
+def load_cached_data(db_name='crypto_data.db', table_name='prices'):
+    engine = create_engine(f'sqlite:///{db_name}', echo=False)
+    try:
+        df = pd.read_sql(f"SELECT * FROM {table_name}", con=engine, index_col='timestamp', parse_dates=['timestamp'])
+        last_pull = pd.to_datetime(df['pulled_at'].max())
+        if (pd.Timestamp.now() - last_pull).total_seconds() < 86400:
+            print("🕒 Using cached data from SQLite.")
+            return df.drop(columns='pulled_at')
+    except Exception as e:
+        print(f"⚠️ No valid cache found: {e}")
+    return None
+
 if __name__ == "__main__":
-    # Example usage
     coin_ids = ['bitcoin', 'ethereum', 'solana']
-    df = fetch_multiple_coins(coin_ids, days='365')
-    print(df.head())
-    df.to_csv('crypto_prices.csv')
-    # Save to SQLite
-    store_to_sqlite(df)
+    df = load_cached_data()
+    if df is None:
+        df = fetch_multiple_coins(coin_ids, days='365')
+        print(df.head())
+        df.to_csv('crypto_prices.csv')
+        store_to_sqlite(df)
+    else:
+        print(df.head())
