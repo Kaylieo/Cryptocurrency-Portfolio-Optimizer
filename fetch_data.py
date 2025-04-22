@@ -52,9 +52,13 @@ class CryptoDataFetcher:
         try:
             df = pd.read_sql(f"SELECT * FROM {self.table_name}", con=self.engine, index_col='timestamp', parse_dates=['timestamp'])
             last_pull = pd.to_datetime(df['pulled_at'].max())
-            if (pd.Timestamp.now() - last_pull).total_seconds() < 86400:
+            # Drop the timestamp column and validate cache contents
+            df_cached = df.drop(columns='pulled_at')
+            if set(df_cached.columns) == set(self.coin_ids) and (pd.Timestamp.now() - last_pull).total_seconds() < 86400:
                 print("🕒 Using cached data from SQLite.")
-                return df.drop(columns='pulled_at')
+                return df_cached
+            else:
+                print("🕒 Cached data is stale or does not match requested coins; refetching.")
         except Exception as e:
             print(f"⚠️ No valid cache found: {e}")
         return None
@@ -82,12 +86,12 @@ def calculate_returns(price_df):
     return np.log(price_df / price_df.shift(1)).dropna()
 
 def portfolio_performance(weights, mean_returns, cov_matrix):
-    expected_return = np.dot(weights, mean_returns) * 252  # Annualized return
-    volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix * 252, weights)))  # Annualized volatility
+    expected_return = np.dot(weights, mean_returns)  # already annualized
+    volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))  # already annualized
     return expected_return, volatility
 
 def portfolio_volatility(weights, cov_matrix):
-    return np.sqrt(np.dot(weights.T, np.dot(cov_matrix * 252, weights)))  # Annualized volatility
+    return np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))  # Already annualized
 
 def optimize_min_volatility(cov_matrix):
     num_assets = len(cov_matrix)
@@ -113,11 +117,16 @@ def optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate=0.01):
         ret, vol = portfolio_performance(weights, mean_returns, cov_matrix)
         return -(ret - risk_free_rate) / vol
 
-    result = minimize(neg_sharpe_ratio, init_guess,
-                      args=(mean_returns, cov_matrix, risk_free_rate),
-                      method='SLSQP',
-                      bounds=bounds,
-                      constraints=constraints)
+    result = minimize(
+        neg_sharpe_ratio,
+        init_guess,
+        args=(mean_returns, cov_matrix, risk_free_rate),
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints
+    )
+
+    print(f"🔎 Max Sharpe Weights: {dict(zip(mean_returns.index, result.x))}")
     return result.x
 
 
