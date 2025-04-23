@@ -1,3 +1,4 @@
+import yfinance as yf
 import requests
 import pandas as pd
 from sqlalchemy import create_engine
@@ -8,6 +9,14 @@ from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 
 class CryptoDataFetcher:
+    # Map CoinGecko IDs to Yahoo Finance symbols for fallback
+    YF_TICKER_MAP = {
+        'bitcoin':   'BTC-USD',
+        'ethereum':  'ETH-USD',
+        'solana':    'SOL-USD',
+        'cardano':   'ADA-USD',
+        'binancecoin': 'BNB-USD'
+    }
     def __init__(self, coin_ids, days='365', db_name='crypto_data.db', table_name='prices'):
         self.coin_ids = coin_ids
         self.days = days
@@ -15,33 +24,117 @@ class CryptoDataFetcher:
         self.table_name = table_name
         self.engine = create_engine(f'sqlite:///{db_name}', echo=False)
 
-    def fetch_from_api(self, coin_id):
+    # def fetch_from_api(self, coin_id):
+    #     """
+    #     Fetch prices for a single coin with retry/backoff on rate limit.
+    #     """
+    #     url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart'
+    #     params = {
+    #         'vs_currency': 'usd',
+    #         'days': self.days,
+    #         'interval': 'daily'
+    #     }
+    #     max_retries = 3
+    #     backoff = 1
+    #     for attempt in range(1, max_retries + 1):
+    #         response = requests.get(url, params=params)
+    #         if response.status_code == 200:
+    #             data = response.json()
+    #             prices = data['prices']
+    #             df = pd.DataFrame(prices, columns=['timestamp', coin_id])
+    #             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    #             df.set_index('timestamp', inplace=True)
+    #             return df
+    #         elif response.status_code == 429:
+    #             print(f"⚠️ Rate limit hit for {coin_id}, retry {attempt}/{max_retries} after {backoff}s...")
+
+    def fetch_from_coingecko(self, coin_id):
+        """
+        Fetch prices for a single coin from CoinGecko with retry/backoff on rate limit.
+        Returns a DataFrame with 'timestamp' as index and coin_id as column.
+        """
         url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart'
         params = {
             'vs_currency': 'usd',
             'days': self.days,
             'interval': 'daily'
         }
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch data for {coin_id}: {response.json()}")
-        data = response.json()
-        prices = data['prices']
-        df = pd.DataFrame(prices, columns=['timestamp', coin_id])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        return df
+        max_retries = 5
+        backoff = 1
+        for attempt in range(1, max_retries + 1):
+            response = requests.get(url, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                prices = data['prices']
+                df = pd.DataFrame(prices, columns=['timestamp', coin_id])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+                return df
+            elif response.status_code == 429:
+                print(f"⚠️ Rate limit hit for {coin_id}, retry {attempt}/{max_retries} after {backoff}s...")
+                time.sleep(backoff)
+                backoff *= 2
+            else:
+                print(f"❌ Failed to fetch data for {coin_id} from CoinGecko: {response.text}")
+                break
+        print(f"❌ Exceeded max retries for {coin_id} from CoinGecko.")
+        return None
 
     def fetch_all(self):
-        merged_df = None
-        for coin_id in self.coin_ids:
-            df = self.fetch_from_api(coin_id)
-            if merged_df is None:
-                merged_df = df
-            else:
-                merged_df = merged_df.join(df, how='outer')
-        return merged_df.dropna()
-
+        # 1. Try Yahoo Finance for all coins that have a mapping
+        symbols = [self.YF_TICKER_MAP[c] for c in self.coin_ids if c in self.YF_TICKER_MAP]
+        data = None
+        if symbols:
+            try:
+                yf_data = yf.download(
+                    symbols,
+                    period=f"{self.days}d",
+                    interval="1d",
+                    progress=False
+                )
+                if not yf_data.empty and 'Close' in yf_data:
+                    close = yf_data['Close']
+                    close.columns = [coin for coin in self.coin_ids if coin in self.YF_TICKER_MAP]
+                    close.index.name = 'timestamp'
+                    data = close
+                    print("✅ Yahoo Finance data fetched.")
+            except Exception as e:
+                print(f"⚠️ Yahoo Finance fetch error: {e}")
+        # 2. For any missing coins or missing data, try CoinGecko
+        missing_coins = [coin for coin in self.coin_ids if data is None or coin not in data.columns]
+        if missing_coins:
+            print(f"🔄 Fetching missing coins from CoinGecko: {missing_coins}")
+            cg_frames = []
+            for coin in missing_coins:
+                cg_df = self.fetch_from_coingecko(coin)
+                if cg_df is not None:
+                    cg_frames.append(cg_df)
+            if cg_frames:
+                cg_data = pd.concat(cg_frames, axis=1)
+                if data is not None:
+                    data = pd.concat([data, cg_data], axis=1)
+                else:
+                    data = cg_data
+        if data is None or data.empty:
+            raise Exception("No data could be fetched from Yahoo Finance or CoinGecko.")
+        # 3. Align time index, drop rows with missing values
+        data = data.sort_index()
+        data = data.loc[~data.index.duplicated(keep='first')]
+        # Interpolate small gaps (max 2 days), then drop remaining NaNs
+        data = data.interpolate(method='time', limit=2)
+        n_missing = data.isna().sum().sum()
+        if n_missing > 0:
+            print(f"⚠️ {n_missing} missing values after interpolation, dropping rows with NaNs.")
+        data = data.dropna()
+        # 4. Remove outliers (returns > 4 std from mean)
+        returns = np.log(data / data.shift(1))
+        outlier_mask = (np.abs(returns - returns.mean()) > 4 * returns.std())
+        if outlier_mask.any().any():
+            print("⚠️ Outliers detected and set to NaN.")
+            data[outlier_mask] = np.nan
+            data = data.interpolate(method='time', limit=1).dropna()
+        print(f"✅ Final data shape: {data.shape}")
+        return data
     def store_to_sqlite(self, df):
         df = df.copy()
         df['pulled_at'] = pd.Timestamp.now()
@@ -68,7 +161,45 @@ class CryptoDataFetcher:
         if df is None:
             df = self.fetch_all()
             self.store_to_sqlite(df)
+        # Save fetched DataFrame for downstream calculations
+        self.data = df.copy()
+        print(f"✅ Data loaded for coins: {list(df.columns)} | {len(df)} rows.")
         return df
+
+    def calculate_returns(self) -> pd.DataFrame:
+        """
+        Calculate and store daily log returns of the fetched price data.
+        Uses the actual number of trading days for annualization.
+        Returns:
+            pd.DataFrame: Daily log returns.
+        """
+        if not hasattr(self, 'data'):
+            raise AttributeError("Data not loaded. Call get_data() first.")
+        returns = np.log(self.data / self.data.shift(1))
+        returns = returns.dropna()
+        self.returns = returns
+        print(f"✅ Calculated returns: {returns.shape[0]} days")
+        return returns
+
+    def get_annualized_mean_returns(self) -> pd.Series:
+        """
+        Calculate and return annualized mean returns based on daily log returns.
+        Returns:
+            pd.Series: Annualized mean returns.
+        """
+        if not hasattr(self, 'returns'):
+            self.calculate_returns()
+        return self.returns.mean() * 252
+
+    def get_annualized_covariance(self) -> pd.DataFrame:
+        """
+        Calculate and return annualized covariance matrix based on daily log returns.
+        Returns:
+            pd.DataFrame: Annualized covariance matrix.
+        """
+        if not hasattr(self, 'returns'):
+            self.calculate_returns()
+        return self.returns.cov() * 252
 
 
 if __name__ == "__main__":
@@ -96,7 +227,8 @@ def portfolio_volatility(weights, cov_matrix):
 def optimize_min_volatility(cov_matrix):
     num_assets = len(cov_matrix)
     init_guess = [1. / num_assets] * num_assets
-    bounds = tuple((0.05, 1) for _ in range(num_assets))  # Min 5% per asset
+    # Allow zero weight so assets can be excluded entirely
+    bounds = tuple((0, 1) for _ in range(num_assets))
     constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
 
     result = minimize(portfolio_volatility,
@@ -109,8 +241,10 @@ def optimize_min_volatility(cov_matrix):
 
 def optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate=0.01):
     num_assets = len(mean_returns)
+    # Start from equal weights
     init_guess = [1. / num_assets] * num_assets
-    bounds = tuple((0.05, 1) for _ in range(num_assets))
+    # Allow zero weight so assets can be excluded for max Sharpe
+    bounds = tuple((0, 1) for _ in range(num_assets))
     constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
 
     def neg_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate):
@@ -153,7 +287,7 @@ def plot_efficient_frontier(mean_returns, cov_matrix, n_portfolios=5000):
 
     return results
 st.set_page_config(page_title="Crypto Portfolio Optimizer", layout="centered")
-st.title("💸 Cryptocurrency Portfolio Optimizer")
+st.title("Cryptocurrency Portfolio Optimizer")
 
 # Sidebar Inputs
 st.sidebar.header("Portfolio Settings")
@@ -177,10 +311,10 @@ if selected_coins:
 
     if opt_mode == "Minimum Volatility":
         weights = optimize_min_volatility(cov_matrix)
-        st.subheader("🚀 Optimizing Portfolio (Minimum Volatility)")
+        st.subheader("🚀 Optimizing Portfolio")
     else:
         weights = optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate=0.01)
-        st.subheader("🚀 Optimizing Portfolio (Maximum Sharpe Ratio)")
+        st.subheader("🚀 Optimizing Portfolio")
 
     ret, vol = portfolio_performance(weights, mean_returns, cov_matrix)
     sharpe = (ret - 0.01) / vol
