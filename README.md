@@ -36,7 +36,7 @@ This project implements a streamlined Python architecture for financial modeling
 
 ```
 Cryptocurrency-Portfolio-Optimization/
-├── fetch_data.py        # Main app file (data fetching + Streamlit UI)
+├── app.py        # Main app file (data fetching + Streamlit UI)
 ├── requirements.txt     # Python dependencies
 └── README.md            # Project documentation
 ```
