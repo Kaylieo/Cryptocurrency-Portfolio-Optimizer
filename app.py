@@ -1,3 +1,11 @@
+"""Cryptocurrency Portfolio Optimizer App
+
+This Streamlit app fetches historical price data for selected cryptocurrencies,
+computes daily returns, and optimizes portfolios for minimum volatility or
+maximum Sharpe ratio. Displays allocation, performance metrics, and
+efficient frontier plots.
+"""
+
 import logging
 import time
 from sqlalchemy import create_engine
@@ -8,14 +16,11 @@ import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 import yfinance as yf
 import streamlit as st
+from typing import List, Tuple
 
 # === Constants ===
 TRADING_DAYS = 252
 DEFAULT_RISK_FREE_RATE = 0.01
-
-# Helper: Generate equal weights for given number of assets
-def equal_weights(n):
-    return [1.0 / n] * n
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,7 +36,7 @@ class CryptoDataFetcher:
         'binancecoin':  'BNB-USD'
     }
 
-    def __init__(self, coin_ids, days='365', db_name='crypto_data.db', table_name='prices'):
+    def __init__(self, coin_ids: List[str], days: str = '365', db_name: str = 'crypto_data.db', table_name: str = 'prices'):
         self.coin_ids = coin_ids
         self.days = days
         self.db_name = db_name
@@ -40,7 +45,7 @@ class CryptoDataFetcher:
 
 
     @staticmethod
-    def fetch_from_coingecko(coin_id, days='365'):
+    def fetch_from_coingecko(coin_id: str, days: str = '365') -> pd.DataFrame:
         """Fetch prices for a single coin from CoinGecko with retry/backoff on rate limit.
         Returns a DataFrame with 'timestamp' as index and coin_id as column."""
         url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart'
@@ -71,7 +76,7 @@ class CryptoDataFetcher:
         return None
 
 
-    def fetch_all(self):
+    def fetch_all(self) -> pd.DataFrame:
         #  1. Try Yahoo Finance for all coins that have a mapping
         symbols = [self.YF_TICKER_MAP[c] for c in self.coin_ids if c in self.YF_TICKER_MAP]
         data = None
@@ -128,7 +133,7 @@ class CryptoDataFetcher:
         return data
 
 
-    def store_to_sqlite(self, df):
+    def store_to_sqlite(self, df: pd.DataFrame) -> None:
         df = df.copy()
         df['pulled_at'] = pd.Timestamp.now()
         try:
@@ -138,7 +143,7 @@ class CryptoDataFetcher:
             logger.error(f"❌ Failed to store data in SQLite: {e}")
 
 
-    def load_cached_data(self):
+    def load_cached_data(self) -> pd.DataFrame:
         try:
             df = pd.read_sql(f"SELECT * FROM {self.table_name}", con=self.engine, index_col='timestamp', parse_dates=['timestamp'])
             last_pull = pd.to_datetime(df['pulled_at'].max())
@@ -154,7 +159,7 @@ class CryptoDataFetcher:
         return None
 
 
-    def get_data(self):
+    def get_data(self) -> pd.DataFrame:
         df = self.load_cached_data()
         if df is None:
             df = self.fetch_all()
@@ -197,29 +202,32 @@ class CryptoDataFetcher:
         return self.returns.cov() * TRADING_DAYS
 
 
-def load_price_data(coin_ids, days='365'):
+@st.cache_data
+def load_price_data(coin_ids: List[str], days: str = '365') -> pd.DataFrame:
+    """Load price data for given coins and timeframe."""
     fetcher = CryptoDataFetcher(coin_ids, days)
     df = fetcher.get_data()
     return df
 
 
-def calculate_returns(price_df):
+def calculate_returns(price_df: pd.DataFrame) -> pd.DataFrame:
     return np.log(price_df / price_df.shift(1)).dropna()
 
 
-def portfolio_performance(weights, mean_returns, cov_matrix):
+def portfolio_performance(weights: np.ndarray, mean_returns: pd.Series, cov_matrix: pd.DataFrame) -> Tuple[float, float]:
     expected_return = np.dot(weights, mean_returns)    #  Already annualized
     volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))    #  Already annualized
     return expected_return, volatility
 
 
-def portfolio_volatility(weights, cov_matrix):
+def portfolio_volatility(weights: np.ndarray, cov_matrix: pd.DataFrame) -> float:
     return np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))    #  Already annualized
 
 
-def optimize_min_volatility(cov_matrix, max_weight=1.0):
+def optimize_min_volatility(cov_matrix: pd.DataFrame, max_weight: float = 1.0) -> np.ndarray:
+    """Optimize for minimum portfolio volatility given a covariance matrix and weight cap."""
     num_assets = len(cov_matrix)
-    init_guess = equal_weights(num_assets)
+    init_guess = np.array([1.0 / num_assets] * num_assets)
     #  Allow zero weight so assets can be excluded entirely
     bounds = tuple((0, max_weight) for _ in range(num_assets))
     constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
@@ -232,10 +240,11 @@ def optimize_min_volatility(cov_matrix, max_weight=1.0):
     return result.x
 
 
-def optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate=0.01, max_weight=1.0):
+def optimize_max_sharpe(mean_returns: pd.Series, cov_matrix: pd.DataFrame, risk_free_rate: float = DEFAULT_RISK_FREE_RATE, max_weight: float = 1.0) -> np.ndarray:
+    """Optimize for maximum Sharpe ratio given expected returns, covariance, and risk-free rate."""
     num_assets = len(mean_returns)
     #  Start from equal weights
-    init_guess = equal_weights(num_assets)
+    init_guess = np.array([1.0 / num_assets] * num_assets)
     #  Allow zero weight so assets can be excluded for max Sharpe
     bounds = tuple((0, max_weight) for _ in range(num_assets))
     constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
@@ -256,7 +265,7 @@ def optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate=0.01, max_weigh
     return result.x
 
 
-def plot_pie(weights, assets):
+def plot_pie(weights: np.ndarray, assets: List[str]) -> plt.Figure:
     weights = np.array(weights)
     assets = np.array(assets)
     nonzero_indices = weights > 0.001    #  Filter out very small weights
@@ -267,7 +276,7 @@ def plot_pie(weights, assets):
     return fig
 
 
-def plot_efficient_frontier(mean_returns, cov_matrix, n_portfolios=5000, optimal_points=[]):
+def plot_efficient_frontier(mean_returns: pd.Series, cov_matrix: pd.DataFrame, n_portfolios: int = 5000, optimal_points: List[Tuple[float, float]] = []) -> np.ndarray:
     results = np.zeros((3, n_portfolios))
     for i in range(n_portfolios):
         weights = np.random.dirichlet(np.ones(len(mean_returns)))
@@ -290,116 +299,63 @@ def plot_efficient_frontier(mean_returns, cov_matrix, n_portfolios=5000, optimal
     return results
 
 
-st.set_page_config(
-    page_title="Crypto Portfolio Optimizer",
-    layout="centered",
-    page_icon="💹",
-    initial_sidebar_state="expanded"
-)
-st.markdown("""
-<style>
-    /* Background and font */
-    body, .main {
-        background-color: #0B132B;
-        color: #E0E1DD;
-        font-family: 'Segoe UI', sans-serif;
-    }
-
-    /* Header colors */
-    h1, h2, h3, h4, h5, h6 {
-        text-align: center;
-        color: #E0E1DD;
-    }
-
-    /* Sidebar tweaks */
-    section[data-testid="stSidebar"] {
-        background-color: #1C2541;
-        color: #E0E1DD;
-    }
-    section[data-testid="stSidebar"] *:not(input):not(select):not(option) {
-        color: #E0E1DD !important;
-    }
-
-    /* Info and success messages */
-    div[role="alert"][class*="stAlert-success"] {
-        background-color: #1D3557 !important;
-        border-left: 5px solid #43AA8B;
-        color: #E0E1DD;
-    }
-
-    div[role="alert"][class*="stAlert-info"] {
-        background-color: #274C77 !important;
-        border-left: 5px solid #A9DEF9;
-        color: #E0E1DD;
-    }
-
-    /* Buttons */
-    .stButton>button {
-        background-color: #3E92CC;
-        color: white;
-    }
-
-    /* Dropdown and multiselect dark theme fixes */
-    div[data-baseweb="select"] input,
-    div[data-baseweb="select"] div {
-        color: #E0E1DD !important;
-    }
-    div[data-baseweb="select"] * {
-        color: #E0E1DD !important;
-    }
-    div[data-baseweb="select"] div[role="option"] {
-        color: #E0E1DD !important;
-    }
-    div[data-baseweb="tag"] span {
-        color: #0B132B !important;
-        background-color: #E0E1DD !important;
-        border-radius: 5px;
-        padding: 2px 6px;
-    }
-
-    /* Ensure Timeframe dropdown input and selected values are visible */
-    div[data-baseweb="select"] input,
-    div[data-baseweb="select"] div[role="combobox"],
-    div[data-baseweb="select"] div[role="option"],
-    div[data-baseweb="select"] div[role="button"] {
-        color: #E0E1DD !important;
-    }
-
-    /* Improve visibility of selected tags (coin names) */
-    div[data-baseweb="tag"] div {
-        color: #0B132B !important;
-        background-color: #E0E1DD !important;
-        font-weight: bold;
-        border-radius: 5px;
-        padding: 2px 6px;
-    }
-</style>
-""", unsafe_allow_html=True)
-st.title("Cryptocurrency Portfolio Optimizer")
+def apply_theme() -> None:
+    """Inject custom CSS theme into Streamlit."""
+    css = """
+    <style>
+        /* Background and font */
+        body, .main { background-color: #0B132B; color: #E0E1DD; font-family: 'Segoe UI', sans-serif; }
+        /* Header colors */
+        h1, h2, h3, h4, h5, h6 { text-align: center; color: #E0E1DD; }
+        /* Sidebar tweaks */
+        section[data-testid="stSidebar"] { background-color: #1C2541; color: #E0E1DD; }
+        section[data-testid="stSidebar"] *:not(input):not(select):not(option) { color: #E0E1DD !important; }
+        /* Info and success messages */
+        div[role="alert"][class*="stAlert-success"] { background-color: #1D3557 !important; border-left: 5px solid #43AA8B; color: #E0E1DD; }
+        div[role="alert"][class*="stAlert-info"] { background-color: #274C77 !important; border-left: 5px solid #A9DEF9; color: #E0E1DD; }
+        /* Buttons */
+        .stButton>button { background-color: #3E92CC; color: white; }
+        /* Dropdown and multiselect dark theme fixes */
+        div[data-baseweb="select"] input, div[data-baseweb="select"] div, div[data-baseweb="select"] * { color: #E0E1DD !important; }
+        div[data-baseweb="select"] div[role="option"] { color: #E0E1DD !important; }
+        div[data-baseweb="tag"] span { color: #0B132B !important; background-color: #E0E1DD !important; border-radius: 5px; padding: 2px 6px; }
+        div[data-baseweb="tag"] div { color: #0B132B !important; background-color: #E0E1DD !important; font-weight: bold; border-radius: 5px; padding: 2px 6px; }
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
 
 
-#  Sidebar Inputs
-st.sidebar.header("Portfolio Settings")
-coin_options = ["bitcoin", "ethereum", "solana", "cardano", "binancecoin"]
-selected_coins = st.sidebar.multiselect("Select Cryptocurrencies:", coin_options, default=coin_options[:3])
-days = st.sidebar.selectbox("Timeframe (days):", [90, 180, 365, 730], index=2)
-max_weight = st.sidebar.slider("Max Weight Per Asset", min_value=0.0, max_value=1.0, value=1.0, step=0.05)
-risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", min_value=0.0, max_value=10.0, value=1.0, step=0.1) / 100
+def render_sidebar() -> Tuple[List[str], int, float, float, str]:
+    """Render Streamlit sidebar controls and return user selections."""
+    st.sidebar.header("Portfolio Settings")
+    coin_options = list(CryptoDataFetcher.YF_TICKER_MAP.keys())
+    selected_coins = st.sidebar.multiselect("Select Cryptocurrencies:", coin_options, default=coin_options[:3])
+    days = st.sidebar.selectbox("Timeframe (days):", [90, 180, 365, 730], index=2)
+    max_weight = st.sidebar.slider("Max Weight Per Asset", min_value=0.0, max_value=1.0, value=1.0, step=0.05)
+    risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", min_value=0.0, max_value=10.0, value=1.0, step=0.1) / 100
+    opt_mode = st.sidebar.radio("Optimization Mode", ["Minimum Volatility", "Maximum Sharpe Ratio"])
+    return selected_coins, days, max_weight, risk_free_rate, opt_mode
 
-#  Optimization Mode
-opt_mode = st.sidebar.radio("Optimization Mode", ["Minimum Volatility", "Maximum Sharpe Ratio"])
 
-
-if selected_coins:
+def render_results(selected_coins: List[str], days: int, max_weight: float, risk_free_rate: float, opt_mode: str) -> None:
+    """Render portfolio results: fetch data, optimize and display charts."""
+    price_df = load_price_data(selected_coins, days)
+    returns = calculate_returns(price_df)
+    mean_returns = returns.mean() * TRADING_DAYS
+    cov_matrix = returns.cov() * TRADING_DAYS
+    if opt_mode == "Minimum Volatility":
+        weights = optimize_min_volatility(cov_matrix, max_weight=max_weight)
+    else:
+        weights = optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate, max_weight)
+    ret, vol = portfolio_performance(weights, mean_returns, cov_matrix)
+    # Calculate Sharpe ratio
+    sharpe = (ret - risk_free_rate) / vol
+    weights = np.round(weights, 4)
+    # Display allocations, metrics, and charts (unchanged)
     st.markdown(
         f"<div style='text-align: center; color: #31708f; background-color: #d9edf7; padding: 10px; border-radius: 5px; margin-bottom: 10px;'>Fetching data for: {', '.join(selected_coins)}</div>",
         unsafe_allow_html=True
     )
-    fetcher = CryptoDataFetcher(selected_coins, days=str(days))
-    df_prices = fetcher.get_data()
-    df_returns = fetcher.calculate_returns()
-    mean_returns = fetcher.get_annualized_mean_returns()
-    cov_matrix = fetcher.get_annualized_covariance()
     st.markdown(
         "<div style='text-align: center; color: #3c763d; background-color: #dff0d8; padding: 10px; border-radius: 5px; margin-bottom: 10px;'>Data fetched and cleaned successfully.</div>",
         unsafe_allow_html=True
@@ -425,13 +381,6 @@ if selected_coins:
         "cardano": "https://assets.coingecko.com/coins/images/975/thumb/cardano.png",
         "binancecoin": "https://assets.coingecko.com/coins/images/825/thumb/binance-coin-logo.png"
     }
-    if opt_mode == "Minimum Volatility":
-        weights = optimize_min_volatility(cov_matrix, max_weight=max_weight)
-    else:
-        weights = optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate=risk_free_rate, max_weight=max_weight)
-    ret, vol = portfolio_performance(weights, mean_returns, cov_matrix)
-    sharpe = (ret - risk_free_rate) / vol
-    weights = np.round(weights, 4)
     st.markdown("<div style='display:flex;flex-direction:column;align-items:center;'>", unsafe_allow_html=True)
     #  Show coin allocations with logos
     st.markdown("<div style='display:flex;flex-direction:column;align-items:center;width:100%;'>", unsafe_allow_html=True)
@@ -475,5 +424,19 @@ if selected_coins:
         optimal_points=[(minvol_ret, minvol_vol), (maxsharpe_ret, maxsharpe_vol)]
     )
     st.pyplot(plt.gcf())
-else:
-    st.warning("Please select at least one cryptocurrency to begin.")
+
+
+def main() -> None:
+    """Main entrypoint: configure page, apply theme and render UI."""
+    st.set_page_config(page_title="Crypto Portfolio Optimizer", layout="centered", page_icon="💹", initial_sidebar_state="expanded")
+    apply_theme()
+    st.title("Cryptocurrency Portfolio Optimizer")
+    selected_coins, days, max_weight, risk_free_rate, opt_mode = render_sidebar()
+    if selected_coins:
+        render_results(selected_coins, days, max_weight, risk_free_rate, opt_mode)
+    else:
+        st.warning("Please select at least one cryptocurrency to begin.")
+
+
+if __name__ == "__main__":
+    main()
