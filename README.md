@@ -55,12 +55,22 @@ git clone https://github.com/YOUR_USERNAME/Cryptocurrency-Portfolio-Optimization
 cd Cryptocurrency-Portfolio-Optimization
 ```
 
-2. **Install Dependencies**
+2. **Create a Virtual Environment (Recommended)**
+
+It is recommended to use a virtual environment to manage dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On macOS/Linux
+.venv\Scripts\activate     # On Windows
+```
+
+3. **Install Dependencies**
 ```bash
 pip install -r requirements.txt
 ```
 
-3. **Run the App**
+4. **Run the App**
 ```bash
 streamlit run app.py
 ```
