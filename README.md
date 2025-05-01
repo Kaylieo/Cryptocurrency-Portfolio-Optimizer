@@ -87,7 +87,7 @@ streamlit run app.py
 
 | Optimized Pie | Efficient Frontier | Summary Card |
 |---------------|--------------------|---------------|
-| *(Insert screenshots here)* | *(Insert screenshots here)* | *(Insert screenshots here)* |
+| ![](screenshots/Screenshot%202025-05-01%20at%209.26.04%20AM.png) | ![](screenshots/Screenshot%202025-05-01%20at%209.26.26%20AM.png) | ![](screenshots/Screenshot%202025-05-01%20at%209.26.51%20AM.png) |
 
 ## 📚 Dependencies
 
