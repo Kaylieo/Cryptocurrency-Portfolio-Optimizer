@@ -13,6 +13,7 @@ import requests
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from scipy.optimize import minimize
 import yfinance as yf
 import streamlit as st
@@ -265,7 +266,7 @@ def optimize_max_sharpe(mean_returns: pd.Series, cov_matrix: pd.DataFrame, risk_
     return result.x
 
 
-def plot_pie(weights: np.ndarray, assets: List[str]) -> plt.Figure:
+def plot_pie(weights: np.ndarray, assets: List[str]) -> Figure:
     weights = np.array(weights)
     assets = np.array(assets)
     nonzero_indices = weights > 0.001    #  Filter out very small weights
@@ -276,7 +277,12 @@ def plot_pie(weights: np.ndarray, assets: List[str]) -> plt.Figure:
     return fig
 
 
-def plot_efficient_frontier(mean_returns: pd.Series, cov_matrix: pd.DataFrame, n_portfolios: int = 5000, optimal_points: List[Tuple[float, float]] = []) -> np.ndarray:
+def plot_efficient_frontier(
+    mean_returns: pd.Series,
+    cov_matrix: pd.DataFrame,
+    n_portfolios: int = 5000,
+    optimal_points: List[Tuple[float, float]] = []
+) -> Figure:
     results = np.zeros((3, n_portfolios))
     for i in range(n_portfolios):
         weights = np.random.dirichlet(np.ones(len(mean_returns)))
@@ -296,7 +302,7 @@ def plot_efficient_frontier(mean_returns: pd.Series, cov_matrix: pd.DataFrame, n
         else:
             ax.scatter(point[1], point[0], marker='o', color='#F94144', s=150, label='Max Sharpe Portfolio')
     ax.legend()
-    return results
+    return fig
 
 
 def apply_theme() -> None:
@@ -337,7 +343,13 @@ def render_sidebar() -> Tuple[List[str], int, float, float, str]:
     return selected_coins, days, max_weight, risk_free_rate, opt_mode
 
 
-def render_results(selected_coins: List[str], days: int, max_weight: float, risk_free_rate: float, opt_mode: str) -> None:
+def render_results(
+    selected_coins: List[str],
+    days: int,
+    max_weight: float,
+    risk_free_rate: float,
+    opt_mode: str
+) -> None:
     """Render portfolio results: fetch data, optimize and display charts."""
     price_df = load_price_data(selected_coins, days)
     returns = calculate_returns(price_df)
@@ -419,11 +431,11 @@ def render_results(selected_coins: List[str], days: int, max_weight: float, risk
     minvol_ret, minvol_vol = portfolio_performance(minvol_weights, mean_returns, cov_matrix)
     maxsharpe_weights = optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate=risk_free_rate, max_weight=max_weight)
     maxsharpe_ret, maxsharpe_vol = portfolio_performance(maxsharpe_weights, mean_returns, cov_matrix)
-    results = plot_efficient_frontier(
+    ef_fig = plot_efficient_frontier(
         mean_returns, cov_matrix,
         optimal_points=[(minvol_ret, minvol_vol), (maxsharpe_ret, maxsharpe_vol)]
     )
-    st.pyplot(plt.gcf())
+    st.pyplot(ef_fig)
 
 
 def main() -> None:
