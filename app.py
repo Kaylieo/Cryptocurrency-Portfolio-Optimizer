@@ -17,11 +17,21 @@ from matplotlib.figure import Figure
 from scipy.optimize import minimize
 import yfinance as yf
 import streamlit as st
-from typing import List, Tuple
+
+from typing import List, Tuple, Optional, Union
+
+# Optional shrinkage estimator (stable covariances). Fallback to sample cov if unavailable.
+try:
+    from sklearn.covariance import LedoitWolf  # type: ignore[import]
+    _HAVE_SKLEARN = True
+except Exception:
+    LedoitWolf = None  # type: ignore[assignment]
+    _HAVE_SKLEARN = False
 
 # === Constants ===
 TRADING_DAYS = 252
 DEFAULT_RISK_FREE_RATE = 0.01
+USE_LEDOIT_WOLF_ALWAYS = True  # Enforce Ledoit–Wolf when available
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,7 +56,7 @@ class CryptoDataFetcher:
 
 
     @staticmethod
-    def fetch_from_coingecko(coin_id: str, days: str = '365') -> pd.DataFrame:
+    def fetch_from_coingecko(coin_id: str, days: str = '365') -> Optional[pd.DataFrame]:
         """Fetch prices for a single coin from CoinGecko with retry/backoff on rate limit.
         Returns a DataFrame with 'timestamp' as index and coin_id as column."""
         url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart'
@@ -80,7 +90,7 @@ class CryptoDataFetcher:
     def fetch_all(self) -> pd.DataFrame:
         #  1. Try Yahoo Finance for all coins that have a mapping
         symbols = [self.YF_TICKER_MAP[c] for c in self.coin_ids if c in self.YF_TICKER_MAP]
-        data = None
+        data: Optional[pd.DataFrame] = None
         if symbols:
             try:
                 yf_data = yf.download(
@@ -89,16 +99,30 @@ class CryptoDataFetcher:
                     interval="1d",
                     progress=False
                 )
-                if not yf_data.empty and 'Close' in yf_data:
-                    close = yf_data['Close']
+                if yf_data is None:
+                    raise ValueError("Yahoo Finance returned no data.")
+                close: Optional[pd.DataFrame] = None
+                # Handle both MultiIndex and flat columns returned by yfinance
+                if isinstance(yf_data.columns, pd.MultiIndex):
+                    if 'Close' in list(yf_data.columns.levels[0]):
+                        close = yf_data['Close']  # type: ignore[index]
+                else:
+                    if 'Close' in yf_data.columns:
+                        close = yf_data['Close']  # type: ignore[index]
+                if close is not None and not close.empty:
+                    # rename columns back to our coin_ids order subset
                     close.columns = [coin for coin in self.coin_ids if coin in self.YF_TICKER_MAP]
                     close.index.name = 'timestamp'
                     data = close
                     logger.info("✅ Yahoo Finance data fetched.")
             except Exception as e:
                 logger.warning(f"⚠️ Yahoo Finance fetch error: {e}")
+
         #  2. For any missing coins or missing data, try CoinGecko
-        missing_coins = [coin for coin in self.coin_ids if data is None or coin not in data.columns]
+        if data is None:
+            missing_coins = self.coin_ids
+        else:
+            missing_coins = [coin for coin in self.coin_ids if coin not in list(data.columns)]
         if missing_coins:
             logger.info(f"🔄 Fetching missing coins from CoinGecko: {missing_coins}")
             cg_frames = []
@@ -112,6 +136,7 @@ class CryptoDataFetcher:
                     data = pd.concat([data, cg_data], axis=1)
                 else:
                     data = cg_data
+
         if data is None or data.empty:
             raise Exception("No data could be fetched from Yahoo Finance or CoinGecko.")
         #  3. Align time index, drop rows with missing values
@@ -144,7 +169,7 @@ class CryptoDataFetcher:
             logger.error(f"❌ Failed to store data in SQLite: {e}")
 
 
-    def load_cached_data(self) -> pd.DataFrame:
+    def load_cached_data(self) -> Optional[pd.DataFrame]:
         try:
             df = pd.read_sql(f"SELECT * FROM {self.table_name}", con=self.engine, index_col='timestamp', parse_dates=['timestamp'])
             last_pull = pd.to_datetime(df['pulled_at'].max())
@@ -161,7 +186,7 @@ class CryptoDataFetcher:
 
 
     def get_data(self) -> pd.DataFrame:
-        df = self.load_cached_data()
+        df: Optional[pd.DataFrame] = self.load_cached_data()
         if df is None:
             df = self.fetch_all()
             self.store_to_sqlite(df)
@@ -178,7 +203,8 @@ class CryptoDataFetcher:
             pd.DataFrame: Daily log returns."""
         if not hasattr(self, 'data'):
             raise AttributeError("Data not loaded. Call get_data() first.")
-        returns = np.log(self.data / self.data.shift(1))
+        ratio: pd.DataFrame = self.data.div(self.data.shift(1))
+        returns: pd.DataFrame = ratio.apply(np.log)
         returns = returns.dropna()
         self.returns = returns
         logger.info(f"✅ Calculated returns: {returns.shape[0]} days")
@@ -204,25 +230,40 @@ class CryptoDataFetcher:
 
 
 @st.cache_data
-def load_price_data(coin_ids: List[str], days: str = '365') -> pd.DataFrame:
+def load_price_data(coin_ids: List[str], days: Union[int, str] = '365') -> pd.DataFrame:
     """Load price data for given coins and timeframe."""
-    fetcher = CryptoDataFetcher(coin_ids, days)
-    df = fetcher.get_data()
-    return df
+    fetcher = CryptoDataFetcher(coin_ids, str(days))
+    return fetcher.get_data()
 
 
 def calculate_returns(price_df: pd.DataFrame) -> pd.DataFrame:
-    return np.log(price_df / price_df.shift(1)).dropna()
+    ratio: pd.DataFrame = price_df.div(price_df.shift(1))
+    returns: pd.DataFrame = ratio.apply(np.log)
+    return returns.dropna()
 
 
 def portfolio_performance(weights: np.ndarray, mean_returns: pd.Series, cov_matrix: pd.DataFrame) -> Tuple[float, float]:
-    expected_return = np.dot(weights, mean_returns)    #  Already annualized
-    volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))    #  Already annualized
-    return expected_return, volatility
+    """Return arithmetic expected return (annual) and annual volatility.
+    `mean_returns` must be annualized *log* means; `cov_matrix` annualized covariance of daily log returns.
+    """
+    w = np.asarray(weights, dtype=float)
+    mu = mean_returns.to_numpy(dtype=float)
+    cov = cov_matrix.to_numpy(dtype=float)
+
+    # Portfolio annual log-mean and variance
+    mu_log = float(np.dot(w, mu))
+    var_a = float(np.dot(w, np.dot(cov, w)))
+    vol_a = float(np.sqrt(var_a))
+
+    # Convert log mean/variance to arithmetic expected annual return for display/Sharpe
+    exp_return = float(np.exp(mu_log + 0.5 * var_a) - 1.0)
+    return exp_return, vol_a
 
 
 def portfolio_volatility(weights: np.ndarray, cov_matrix: pd.DataFrame) -> float:
-    return np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))    #  Already annualized
+    cov = cov_matrix.to_numpy(dtype=float)
+    w = np.asarray(weights, dtype=float)
+    return float(np.sqrt(np.dot(w.T, np.dot(cov, w))))
 
 
 def optimize_min_volatility(cov_matrix: pd.DataFrame, max_weight: float = 1.0) -> np.ndarray:
@@ -231,7 +272,7 @@ def optimize_min_volatility(cov_matrix: pd.DataFrame, max_weight: float = 1.0) -
     init_guess = np.array([1.0 / num_assets] * num_assets)
     #  Allow zero weight so assets can be excluded entirely
     bounds = tuple((0, max_weight) for _ in range(num_assets))
-    constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+    constraints = {'type': 'eq', 'fun': lambda w: float(np.sum(w)) - 1.0}
     result = minimize(portfolio_volatility,
                       init_guess,
                       args=(cov_matrix,),
@@ -248,7 +289,7 @@ def optimize_max_sharpe(mean_returns: pd.Series, cov_matrix: pd.DataFrame, risk_
     init_guess = np.array([1.0 / num_assets] * num_assets)
     #  Allow zero weight so assets can be excluded for max Sharpe
     bounds = tuple((0, max_weight) for _ in range(num_assets))
-    constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+    constraints = {'type': 'eq', 'fun': lambda x: float(np.sum(x)) - 1.0}
 
     def neg_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate):
         ret, vol = portfolio_performance(weights, mean_returns, cov_matrix)
@@ -267,13 +308,18 @@ def optimize_max_sharpe(mean_returns: pd.Series, cov_matrix: pd.DataFrame, risk_
 
 
 def plot_pie(weights: np.ndarray, assets: List[str]) -> Figure:
-    weights = np.array(weights)
-    assets = np.array(assets)
-    nonzero_indices = weights > 0.001    #  Filter out very small weights
+    weights = np.asarray(weights, dtype=float)
+    keep = weights > 0.001    #  Filter out very small weights
     fig, ax = plt.subplots(figsize=(6, 6))
     cmap = plt.get_cmap('viridis')
-    colors = cmap(np.linspace(0, 1, len(weights[nonzero_indices])))
-    ax.pie(weights[nonzero_indices], labels=assets[nonzero_indices], autopct='%1.1f%%', colors=colors)
+    colors_arr: np.ndarray = cmap(np.linspace(0, 1, int(np.sum(keep)))).astype(float)
+    colors_list = [tuple(c) for c in colors_arr]
+    ax.pie(
+        weights[keep],
+        labels=[assets[i] for i, k in enumerate(keep) if k],
+        autopct='%1.1f%%',
+        colors=colors_list
+    )
     return fig
 
 
@@ -343,6 +389,21 @@ def render_sidebar() -> Tuple[List[str], int, float, float, str]:
     return selected_coins, days, max_weight, risk_free_rate, opt_mode
 
 
+from typing import Optional
+
+def _ledoit_wolf_cov(returns: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Return a Ledoit–Wolf covariance matrix if sklearn is available; otherwise None.
+    This guards the call so static type checkers don't complain when LedoitWolf is None.
+    """
+    # If sklearn isn't available, don't attempt to call LedoitWolf
+    if not _HAVE_SKLEARN or LedoitWolf is None:
+        return None
+    try:
+        lw = LedoitWolf().fit(returns.values)
+        return pd.DataFrame(lw.covariance_, index=returns.columns, columns=returns.columns)
+    except Exception:
+        return None
+
 def render_results(
     selected_coins: List[str],
     days: int,
@@ -353,8 +414,17 @@ def render_results(
     """Render portfolio results: fetch data, optimize and display charts."""
     price_df = load_price_data(selected_coins, days)
     returns = calculate_returns(price_df)
-    mean_returns = returns.mean() * TRADING_DAYS
-    cov_matrix = returns.cov() * TRADING_DAYS
+    mean_returns = returns.mean(numeric_only=True) * TRADING_DAYS  # annualized log means
+    cov_matrix = _ledoit_wolf_cov(returns)
+    if cov_matrix is None:
+        if USE_LEDOIT_WOLF_ALWAYS:
+            st.error("Ledoit–Wolf covariance estimator not available. Install scikit-learn: `pip install scikit-learn`.")
+            return
+        else:
+            st.info("Using sample covariance (Ledoit–Wolf unavailable).")
+            cov_matrix = returns.cov(numeric_only=True)
+    # annualize
+    cov_matrix = cov_matrix * TRADING_DAYS
     if opt_mode == "Minimum Volatility":
         weights = optimize_min_volatility(cov_matrix, max_weight=max_weight)
     else:
