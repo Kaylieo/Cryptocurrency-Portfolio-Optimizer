@@ -31,8 +31,22 @@ build/
 .ipynb_checkpoints
 
 # Streamlit cache
-.streamlit/config.toml
-.streamlit/secrets.toml
+.streamlit/
 
 # VSCode
 .vscode/
+
+# Temporary environments
+test_env/
+
+# Coverage/test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS junk files
+Thumbs.db
+
+# Model artifacts
+*.pkl
+*.joblib
