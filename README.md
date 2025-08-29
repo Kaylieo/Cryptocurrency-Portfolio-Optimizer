@@ -70,7 +70,7 @@ cd Cryptocurrency-Portfolio-Optimization
 It is recommended to use a virtual environment to manage dependencies:
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate  # On macOS/Linux
 .venv\Scripts\activate     # On Windows
 ```
@@ -131,3 +131,4 @@ See `requirements.txt` for the full list of packages used, including:
 ## 📜 License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
